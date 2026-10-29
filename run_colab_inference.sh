@@ -14,6 +14,8 @@ Options:
       --mode MODE     reference (default) or first_frame
       --width PIXELS   Output width (default: 1344; multiple of 32)
       --height PIXELS  Output height (default: 768; multiple of 32)
+      --duration SECS  Output clip length in seconds, 4–15 (default: 12)
+      --seed INTEGER   Explicit random seed (0 to 2^64-1)
   -o, --output PATH   Output MP4 path (default: next to the first image)
   -h, --help          Show this help
 
@@ -33,12 +35,15 @@ EOF
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 RUNNER="$SCRIPT_DIR/scripts/runner.py"
+export PATH="${PATH:+$PATH:}${HOME:-}/.local/bin:/opt/homebrew/bin:/usr/local/bin"
 INPUT_IMAGES=()
 PROMPT_FILE=""
 OUTPUT_TARGET=""
 INFERENCE_MODE="reference"
 WIDTH="1344"
 HEIGHT="768"
+DURATION="${H3_DURATION_SECONDS:-12}"
+SEED=""
 
 while (($#)); do
   case "$1" in
@@ -70,6 +75,16 @@ while (($#)); do
     --height)
       (($# >= 2)) || { echo "Missing height after $1" >&2; usage >&2; exit 2; }
       HEIGHT="$2"
+      shift 2
+      ;;
+    --duration)
+      (($# >= 2)) || { echo "Missing duration after $1" >&2; usage >&2; exit 2; }
+      DURATION="$2"
+      shift 2
+      ;;
+    --seed)
+      (($# >= 2)) || { echo "Missing seed after $1" >&2; usage >&2; exit 2; }
+      SEED="$2"
       shift 2
       ;;
     -h|--help)
@@ -108,7 +123,8 @@ EXEC_TIMEOUT="${COLAB_EXEC_TIMEOUT:-3600}"
 
 ARGS=(single)
 for input_path in "${INPUT_IMAGES[@]}"; do ARGS+=(--image "$input_path"); done
-ARGS+=(--prompt "$PROMPT_FILE" --mode "$INFERENCE_MODE" --width "$WIDTH" --height "$HEIGHT" --gpu "${COLAB_GPU:-A100}" --timeout "$EXEC_TIMEOUT")
+ARGS+=(--prompt "$PROMPT_FILE" --mode "$INFERENCE_MODE" --width "$WIDTH" --height "$HEIGHT" --duration "$DURATION" --gpu "${COLAB_GPU:-A100}" --timeout "$EXEC_TIMEOUT")
+if [[ -n "$SEED" ]]; then ARGS+=(--seed "$SEED"); fi
 if [[ -n "$OUTPUT_TARGET" ]]; then ARGS+=(--output "$OUTPUT_TARGET"); fi
 if (( ! HIGH_MEM )); then ARGS+=(--no-high-mem); fi
 

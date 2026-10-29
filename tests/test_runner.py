@@ -385,6 +385,61 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((fake_home / ".codex" / "skills" / "minimax-h3-colab" / "SKILL.md").is_file())
         self.assertFalse((fake_home / "skills").exists())
 
+    def test_resolve_jobs_composes_structured_ref2va_shots_manifest(self) -> None:
+        image = self.root / "speaker.png"
+        image.write_bytes(b"fake image")
+        manifest_data = {
+            "jobs": [
+                {
+                    "id": "structured-1",
+                    "title": "structured dialogue clip",
+                    "reference_images": [str(image)],
+                    "duration_seconds": 10,
+                    "subject_definitions": "<Subject 1> is the lawyer in <Picture 1>.",
+                    "summary": "A courtroom questioning clip.",
+                    "retention_analysis": "<Subject 1> maintains consistent glasses and suit.",
+                    "shots": [
+                        {
+                            "start_seconds": 0,
+                            "description": "Medium close-up of <Subject 1> speaking.",
+                            "speaker": "<Subject 1>",
+                            "dialogue": "十点零五分打给你的人是谁？",
+                        },
+                        {
+                            "start_seconds": 5.0,
+                            "description": "Tight close-up of <Subject 1>.",
+                        },
+                    ],
+                    "overall_soundscape": "Quiet room tone with rain.",
+                    "non_diegetic_music": "Subtle cello drone.",
+                }
+            ]
+        }
+        resolved = runner.resolve_jobs(manifest_data, self.root / "output")
+        self.assertEqual(len(resolved), 1)
+        self.assertIn("<d>[Chinese] 十点零五分打给你的人是谁？</d>", resolved[0]["prompt"])
+        self.assertIn("[Shot 2] At 00:05.000", resolved[0]["prompt"])
+
+    def test_call_colab_with_retry_recovers_from_transient_failure(self) -> None:
+        attempts = 0
+
+        def flaky_call(*args: object, **kwargs: object) -> str:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise runner.ColabCommandError("upload", 1, ["WebSocketConnectionClosedException"])
+            return "uploaded"
+
+        with patch.object(runner, "call_colab", side_effect=flaky_call):
+            result = runner.call_colab_with_retry(
+                ["upload", "--session", "s1", "a", "b"],
+                label="upload",
+                timeout=10,
+                retry_delay=0.01,
+            )
+        self.assertEqual(result, "uploaded")
+        self.assertEqual(attempts, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
