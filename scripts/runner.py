@@ -84,8 +84,19 @@ def parse_usage(output: str) -> dict[str, Any]:
     }
 
 
+def _find_binary(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    for fallback_dir in (Path.home() / ".local" / "bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin")):
+        candidate = fallback_dir / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def _colab_path() -> str:
-    path = shutil.which("colab")
+    path = _find_binary("colab")
     if not path:
         raise FileNotFoundError("Colab CLI is not installed or is not on PATH. Install google-colab-cli and sign in with OAuth2 first.")
     return path
@@ -155,6 +166,31 @@ def call_colab(
     if returncode != 0:
         raise ColabCommandError(label, returncode, output)
     return "\n".join(line for line in output if line)
+
+
+def call_colab_with_retry(
+    arguments: list[str],
+    *,
+    label: str,
+    timeout: float,
+    on_line: Callable[[str], None] | None = None,
+    max_attempts: int = 3,
+    retry_delay: float = 1.5,
+) -> str:
+    """Retry idempotent Colab CLI calls (upload/download) against transient WebSocket drops."""
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return call_colab(arguments, label=label, timeout=timeout, on_line=on_line)
+        except (ColabCommandError, ColabTimeoutError) as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                raise
+            if on_line:
+                on_line(f"[retry {attempt}/{max_attempts - 1}] {label} transient error, retrying...")
+            time.sleep(retry_delay * attempt)
+    assert last_exc is not None
+    raise last_exc
 
 
 def check_cli() -> dict[str, str]:
@@ -362,23 +398,37 @@ def resolve_jobs(manifest: dict[str, Any], output_dir: Path) -> list[dict[str, A
             if not path.is_file() or path.stat().st_size == 0:
                 raise ValueError(f"Reference image is missing or empty: {path}")
             image_paths.append(path)
+        image_count = len(image_paths)
+        duration = float(raw.get("duration_seconds", raw.get("duration", 12)))
+        if not math.isfinite(duration) or not 4 <= duration <= 15:
+            raise ValueError(f"Job {index} duration must be between 4 and 15 seconds.")
         prompt_file = raw.get("prompt_file")
         if prompt_file:
             prompt_path = Path(str(prompt_file)).expanduser().resolve()
             if not prompt_path.is_file() or prompt_path.stat().st_size == 0:
                 raise ValueError(f"Prompt file is missing or empty: {prompt_path}")
             prompt = prompt_path.read_text(encoding="utf-8")
+        elif "shots" in raw and not str(raw.get("prompt", "")).strip():
+            if inference_mode != "reference":
+                raise ValueError(f"Job {index} structured shots composition requires 'reference' inference_mode.")
+            prompt = compose_ref2va_prompt(
+                subject_definitions=str(raw.get("subject_definitions", "")),
+                summary=str(raw.get("summary", "")),
+                retention_analysis=str(raw.get("retention_analysis", "")),
+                shots=raw.get("shots"),
+                overall_soundscape=str(raw.get("overall_soundscape", "")),
+                non_diegetic_music=str(raw.get("non_diegetic_music", "N/A")),
+                image_count=image_count,
+                duration_seconds=duration,
+                detailed_description=str(raw.get("detailed_description", "")),
+            )
         else:
             prompt = str(raw.get("prompt", ""))
         if not prompt.strip():
             raise ValueError(f"Job {index} needs a non-empty UTF-8 prompt.")
-        image_count = len(image_paths)
         invalid = sorted({int(n) for n in PICTURE_RE.findall(prompt) if int(n) < 1 or int(n) > image_count})
         if invalid:
             raise ValueError(f"Job {index} prompt references Picture {invalid}; it has {image_count} images.")
-        duration = float(raw.get("duration_seconds", raw.get("duration", 12)))
-        if not math.isfinite(duration) or not 4 <= duration <= 15:
-            raise ValueError(f"Job {index} duration must be between 4 and 15 seconds.")
         seed = raw.get("seed")
         seed = random.SystemRandom().randrange(0, 2**64) if seed in (None, "") else int(seed)
         if not 0 <= seed < 2**64:
@@ -411,7 +461,7 @@ def resolve_jobs(manifest: dict[str, Any], output_dir: Path) -> list[dict[str, A
 def verify_mp4(path: Path) -> None:
     if not path.is_file() or path.stat().st_size == 0:
         raise FileNotFoundError(f"Downloaded MP4 is missing or empty: {path}")
-    ffprobe = shutil.which("ffprobe")
+    ffprobe = _find_binary("ffprobe")
     if not ffprobe:
         return
     probe = subprocess.run(
@@ -492,7 +542,7 @@ def run_batch(
             remote_prefix = f"/content/h3_{job['id']}"
             for image_index, image_path in enumerate(job["reference_images"], start=1):
                 remote = f"{remote_prefix}_reference_{image_index}.img"
-                call_colab(
+                call_colab_with_retry(
                     ["upload", "--session", session, str(image_path), remote],
                     label=f"upload reference {image_index} for {job['title']}",
                     timeout=600,
@@ -504,7 +554,7 @@ def run_batch(
             prompt_path.write_text(job["prompt"], encoding="utf-8")
             remote_prompt = f"{remote_prefix}_prompt.txt"
             remote_output = f"{remote_prefix}_output.mp4"
-            call_colab(
+            call_colab_with_retry(
                 ["upload", "--session", session, str(prompt_path), remote_prompt],
                 label=f"upload prompt for {job['title']}",
                 timeout=120,
@@ -541,7 +591,7 @@ def run_batch(
             current["status"] = "downloading"
             progress["updated_at"] = now_iso()
             write_progress(progress_path, progress)
-            call_colab(
+            call_colab_with_retry(
                 ["download", "--session", session, remote_output, str(job["output_path"])],
                 label=f"download {job['title']}",
                 timeout=900,
@@ -636,6 +686,8 @@ def main() -> int:
     single_parser.add_argument("--mode", choices=sorted(INFERENCE_MODES), default="reference")
     single_parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     single_parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
+    single_parser.add_argument("--duration", type=float, default=float(os.environ.get("H3_DURATION_SECONDS", "12")))
+    single_parser.add_argument("--seed", type=int, default=None)
     single_parser.add_argument("--gpu", default=os.environ.get("COLAB_GPU", "A100"))
     single_parser.add_argument("--no-high-mem", action="store_true")
     single_parser.add_argument("--timeout", type=float, default=float(os.environ.get("COLAB_EXEC_TIMEOUT", "3600")))
@@ -664,18 +716,19 @@ def main() -> int:
         if args.command == "single":
             first = Path(args.image[0]).expanduser().resolve()
             output = Path(args.output).expanduser().resolve() if args.output else first.with_name(first.stem + "_minimax_h3.mp4")
-            manifest = {
-                "jobs": [{
-                    "title": output.stem,
-                    "prompt_file": str(Path(args.prompt).expanduser().resolve()),
-                    "reference_images": args.image,
-                    "inference_mode": args.mode,
-                    "width": args.width,
-                    "height": args.height,
-                    "duration_seconds": float(os.environ.get("H3_DURATION_SECONDS", "12")),
-                    "output_path": str(output),
-                }]
+            single_job: dict[str, Any] = {
+                "title": output.stem,
+                "prompt_file": str(Path(args.prompt).expanduser().resolve()),
+                "reference_images": args.image,
+                "inference_mode": args.mode,
+                "width": args.width,
+                "height": args.height,
+                "duration_seconds": args.duration,
+                "output_path": str(output),
             }
+            if args.seed is not None:
+                single_job["seed"] = args.seed
+            manifest = {"jobs": [single_job]}
             temp_manifest = output.parent / f".h3_{uuid.uuid4().hex[:10]}.json"
             temp_manifest.parent.mkdir(parents=True, exist_ok=True)
             temp_manifest.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
